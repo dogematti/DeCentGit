@@ -98,5 +98,3 @@ From the project root, execute:
 pytest tests/test_cli.py
 ```
 The test suite will automatically start and stop the Docker environment.
-=======
-The test suite will automatically start and stop the Docker environment.
