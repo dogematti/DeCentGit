@@ -1,0 +1,246 @@
+DeCentGit
+
+An Event-Sourced Responsibility Blockchain for Distributed Version Control
+
+Version: 1.0 (Technical Draft)
+Status: Design-complete, implementation-ready
+Scope: Protocol, not product
+
+⸻
+
+Abstract
+
+DeCentGit is a blockchain-enabled, event-sourced version control protocol that separates data ownership from responsibility and ordering. Git remains the authoritative data plane for source code and commit objects, while a blockchain provides a canonical, consensus-ordered ledger of responsibility transitions over repository references. Instead of storing repository state or code on-chain, DeCentGit records minimal cryptographic receipts (“PushAttestations”) that function as state transition inputs. The authoritative protocol state is not stored but deterministically derived by replaying these receipts. This architecture enables decentralized accountability, Sybil-resistant governance, and verifiable ordering without the scalability and usability costs of full on-chain version control.
+
+⸻
+
+1. Problem Statement
+
+Distributed version control systems such as Git provide strong cryptographic integrity guarantees over content, but they do not solve:
+	•	Canonical ordering under adversarial conditions
+	•	Responsibility attribution without a central authority
+	•	Sybil-resistant governance over shared repositories
+	•	Trustless verification of “who accepted what, and when”
+
+Existing centralized platforms (e.g. GitHub) solve these via trusted infrastructure. Existing decentralized Git projects either:
+	•	rely on informal social trust, or
+	•	attempt full on-chain storage, which is impractical.
+
+DeCentGit addresses this gap by externalizing responsibility and ordering into a blockchain while keeping data off-chain.
+
+⸻
+
+2. Design Goals
+	1.	Minimal On-Chain Footprint
+Only store what is strictly necessary to constrain future actions.
+	2.	Event-Sourced State
+State is derived, not stored.
+	3.	Authoritative Responsibility
+The blockchain must be the single source of truth for ordering and accountability.
+	4.	Git Compatibility
+No modification to Git’s object model or hashing rules.
+	5.	Sybil Resistance Without Money
+No transferable tokens; reputation is derived from history.
+
+⸻
+
+3. System Overview
+
+DeCentGit consists of three conceptual planes:
+
+Plane	Responsibility
+Data Plane	Git objects (commits, trees, blobs)
+Responsibility Plane	Blockchain (ordering, accountability)
+Indexing Plane	Untrusted backend / client
+
+Only the responsibility plane is consensus-critical.
+
+⸻
+
+4. Core Data Structures
+
+4.1 PushAttestation (Receipt)
+
+A PushAttestation is the atomic unit recorded on-chain.
+
+A := {
+  repo_id: Hash,
+  ref: String,
+  old_commit: Hash,
+  new_commit: Hash,
+  commit_set_root: Hash,
+  signer_identity: PublicKey,
+  signature: Signature,
+  block_height: u64,
+  block_index: u32
+}
+
+A PushAttestation is not merely a historical record. It is a state transition input.
+
+⸻
+
+5. Event-Sourced Responsibility State
+
+5.1 Derived Responsibility State (DRS)
+
+For each (repo_id, ref) pair, define a derived state:
+
+DRS(repo_id, ref) := {
+  current_commit: Hash,
+  responsible_identity: PublicKey
+}
+
+This state is not stored on-chain.
+
+⸻
+
+5.2 State Reconstruction Algorithm
+
+Let A₀..Aₙ be all PushAttestations for (repo_id, ref), ordered by (block_height, block_index).
+
+state := ⊥
+
+for A in A₀..Aₙ:
+    if state == ⊥:
+        require A.old_commit == GENESIS
+    else:
+        require A.old_commit == state.current_commit
+
+    state.current_commit := A.new_commit
+    state.responsible_identity := A.signer_identity
+
+If any require fails, the attestation is invalid.
+
+⸻
+
+6. Validity Rules
+
+An attestation A is valid iff:
+	1.	A.signature verifies against A.signer_identity
+	2.	A.old_commit equals the current derived commit for (repo_id, ref)
+	3.	No earlier attestation in canonical order already consumed the same old_commit
+
+This introduces a UTXO-like constraint over references, without monetary value.
+
+⸻
+
+7. Record vs State Clarification
+	•	PushAttestations are immutable records.
+	•	The set of accepted PushAttestations constrains future validity.
+	•	Therefore, PushAttestations function as state transitions.
+
+A receipt is blockchain state if it constrains the validity of future transactions.
+
+⸻
+
+8. Off-Chain Data and Trust Model
+
+Commit contents are never validated on-chain.
+
+Security relies on:
+	•	Git’s Merkle DAG for content integrity
+	•	Blockchain consensus for ordering and responsibility
+
+The blockchain does not attest to code correctness, only to:
+	•	ordering
+	•	acceptance
+	•	accountability
+
+⸻
+
+9. Backend and Indexers
+
+Indexers and backends are explicitly untrusted.
+
+Any client can:
+	1.	Fetch attestations from the chain
+	2.	Replay them deterministically
+	3.	Independently verify repository state
+
+This makes the protocol censorship-resistant by design.
+
+⸻
+
+10. Optional Optimization: Head Hint
+
+To reduce replay cost, the chain MAY store:
+
+(repo_id, ref) → latest_attestation_hash
+
+This is a hint, not authoritative state.
+
+⸻
+
+11. Reputation (REP) as Derived State
+
+Reputation is not a token.
+
+REP(identity, t) :=
+    Σ score(Aᵢ) · e^(−λ·(t − time(Aᵢ)))
+
+Properties:
+	•	non-transferable
+	•	time-decaying
+	•	fully event-sourced
+	•	Sybil-resistant through cost of history
+
+⸻
+
+12. Governance
+
+Governance uses REP-weighted voting, but REP is always recomputable from chain history.
+
+No governance action can override:
+	•	canonical ordering
+	•	responsibility attribution
+
+⸻
+
+13. Threat Model
+
+13.1 Byzantine Pushers
+	•	Prevented by old_commit constraint.
+
+13.2 Malicious Backend
+	•	Irrelevant; backend is not trusted.
+
+13.3 History Forking
+	•	Prevented by blockchain finality.
+
+13.4 Sybil Identities
+	•	No transferable value.
+	•	Influence requires sustained historical contribution.
+
+⸻
+
+14. Why Not Full On-Chain State
+
+Storing repository state on-chain:
+	•	adds no new security guarantees
+	•	destroys performance
+	•	harms developer UX
+
+Event-sourced responsibility provides strictly better trade-offs.
+
+⸻
+
+15. Comparison
+
+System	Data On-Chain	State Model
+GitHub	No	Centralized
+Radicle	No	Social
+Gitopia	Partial	Full application chain
+DeCentGit	No	Event-sourced responsibility
+
+
+⸻
+
+16. Conclusion
+
+DeCentGit demonstrates that decentralized version control does not require full on-chain storage. By treating responsibility as the scarce, consensus-critical resource and modeling it as an event-sourced state machine, DeCentGit achieves decentralization, accountability, and scalability simultaneously. Receipts are not mere records; they are the canonical inputs to a protocol-level state machine. This architecture generalizes beyond version control and represents a broader class of non-monetary, responsibility-centric blockchains.
+
+⸻
+
+Appendix A: Key Principle (Single Sentence)
+
+State does not need to be stored — it only needs to be derivable.

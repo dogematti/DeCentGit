@@ -1,0 +1,351 @@
+import os
+import uuid
+import json
+import subprocess
+import requests
+from datetime import datetime
+import time
+import math
+import sys
+import sqlite3
+import ecdsa
+import click
+
+# Add indexer to path to import db module
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from indexer.db import get_db_connection
+
+
+CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help'])
+DECENTGIT_DIR = '.decentgit'
+GENESIS_COMMIT = '0000000000000000000000000000000000000000'
+
+def read_config():
+    """Reads the repo config."""
+    config_path = os.path.join(DECENTGIT_DIR, 'config')
+    if not os.path.exists(config_path):
+        raise click.ClickException("DeCentGit not initialized. Run 'decentgit init'.")
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+def _get_node_url():
+    """Determines the blockchain node URL based on environment, config file, or default."""
+    # Priority 1: Environment variable
+    node_url = os.environ.get('DECENTGIT_NODE_URL')
+    if node_url:
+        return node_url
+
+    # Priority 2: config.json in the project root
+    config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.json')
+    if os.path.exists(config_file_path):
+        try:
+            with open(config_file_path, 'r') as f:
+                project_config = json.load(f)
+                node_url = project_config.get("NODE_URL")
+                if node_url:
+                    return node_url
+        except json.JSONDecodeError:
+            pass # Fall through to default
+
+    # Priority 3: Default value
+    return 'http://127.0.0.1:5000'
+
+@click.group(context_settings=CONTEXT_SETTINGS)
+def cli():
+    """A decentralized git tool based on the DeCentGit protocol."""
+    pass
+
+@cli.command()
+@click.option('--node', default=None, help='The blockchain node URL.')
+@click.option('--force', is_flag=True, help='Force re-initialization and generate a new key pair.')
+def init(node, force):
+    """Initializes a DeCentGit repository and generates a key pair."""
+    if os.path.exists(DECENTGIT_DIR) and not force:
+        raise click.ClickException(f"DeCentGit already initialized in {os.path.abspath(DECENTGIT_DIR)}. Use --force to overwrite.")
+
+    if os.path.exists(DECENTGIT_DIR) and force:
+        click.echo(click.style(f"Reinitializing existing DeCentGit repository in {os.path.abspath(DECENTGIT_DIR)}", fg='yellow'))
+    else:
+        click.echo(f"Initializing empty DeCentGit repository in {os.path.abspath(DECENTGIT_DIR)}")
+        os.makedirs(DECENTGIT_DIR)
+
+    # Generate and save key pair
+    sk = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p)
+    vk = sk.get_verifying_key()
+    
+    private_key_path = os.path.join(DECENTGIT_DIR, 'id_ecdsa')
+    public_key_path = os.path.join(DECENTGIT_DIR, 'id_ecdsa.pub')
+
+    with open(private_key_path, 'wb') as f:
+        f.write(sk.to_pem())
+    os.chmod(private_key_path, 0o600) # Set restrictive permissions
+
+    with open(public_key_path, 'wb') as f:
+        f.write(vk.to_pem())
+
+    signer_identity = vk.to_string().hex()
+    click.echo(f"Generated new identity: {signer_identity}")
+
+    repo_id = str(uuid.uuid4())
+    
+    # Determine the node URL for this repo's config
+    final_node_url = node if node else _get_node_url()
+
+    config = {
+        'repo_id': repo_id,
+        'node': final_node_url,
+        'signer_identity': signer_identity
+    }
+
+    with open(os.path.join(DECENTGIT_DIR, 'config'), 'w') as f:
+        json.dump(config, f, indent=4)
+        
+    # Create or clear the refs file
+    with open(os.path.join(DECENTGIT_DIR, 'refs'), 'w') as f:
+        json.dump({}, f)
+
+    click.echo(f"Repository ID: {repo_id}")
+    click.echo(f"Node: {final_node_url}")
+    click.echo("DeCentGit initialized.")
+
+@cli.command()
+@click.argument('ref_name')
+def push(ref_name):
+    """Pushes a ref to the DeCentGit blockchain."""
+    click.echo(f"Pushing ref {ref_name}...")
+    
+    config = read_config()
+    # Use the node URL stored in the repo's config, not the global one
+    node_url = config['node'] 
+    repo_id = config['repo_id']
+    signer_identity = config['signer_identity']
+
+    # 1. Get the new commit hash
+    try:
+        new_commit = subprocess.check_output(['git', 'rev-parse', ref_name]).strip().decode('utf-8')
+    except subprocess.CalledProcessError:
+        raise click.ClickException(f"Invalid ref: '{ref_name}'. Is this a valid git repository?")
+
+    # 2. Get the old commit hash
+    refs_path = os.path.join(DECENTGIT_DIR, 'refs')
+    with open(refs_path, 'r') as f:
+        refs_data = json.load(f)
+    old_commit = refs_data.get(ref_name, GENESIS_COMMIT)
+    
+    if old_commit == new_commit:
+        click.echo("Everything up-to-date.")
+        return
+
+    click.echo(f"Attesting: {old_commit[:7]} -> {new_commit[:7]}")
+
+    # 3. Create and sign the PushAttestation
+    attestation_data = {
+        'repo_id': repo_id,
+        'ref': ref_name,
+        'old_commit': old_commit,
+        'new_commit': new_commit,
+    }
+    
+    # Create a deterministic, serialized version of the data to sign
+    message_to_sign = json.dumps(attestation_data, sort_keys=True).encode('utf-8')
+
+    try:
+        with open(os.path.join(DECENTGIT_DIR, 'id_ecdsa'), 'rb') as f:
+            sk = ecdsa.SigningKey.from_pem(f.read())
+    except FileNotFoundError:
+        raise click.ClickException("Private key not found. Please run 'decentgit init'.")
+    
+    signature = sk.sign(message_to_sign).hex()
+    
+    full_attestation = {
+        **attestation_data,
+        'signer_identity': signer_identity,
+        'signature': signature
+    }
+
+    # 4. Send to the blockchain node
+    try:
+        response = requests.post(f"{node_url}/attestations/new", json=full_attestation)
+        response.raise_for_status()
+        click.echo(click.style(f"Attestation submitted: {response.json()['message']}", fg='green'))
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to node at {node_url}. Is it running?\n{e}")
+
+    # 5. Mine a block (for prototype purposes)
+    click.echo("Mining new block to confirm attestation...")
+    try:
+        mine_response = requests.get(f"{node_url}/mine")
+        mine_response.raise_for_status()
+        mine_data = mine_response.json()
+        block_hash = mine_data['block_hash']
+        click.echo(click.style(f"Block mined successfully! Hash: {block_hash[:12]}...", fg='green'))
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to mine block on node.\n{e}")
+
+    # 6. Add git note
+    note_message = f"DeCentGit-Attestation: {block_hash}"
+    try:
+        subprocess.check_output(['git', 'notes', 'add', '-f', '-m', note_message, new_commit])
+        click.echo(f"Added git note to commit {new_commit[:7]}.")
+    except subprocess.CalledProcessError as e:
+        click.echo(click.style(f"Warning: Failed to add git note. Is 'git' in your PATH?\n{e}", fg='yellow'))
+
+    # 7. Update local refs state
+    refs_data[ref_name] = new_commit
+    with open(refs_path, 'w') as f:
+        json.dump(refs_data, f, indent=4)
+    
+    click.echo(f"Successfully attested {ref_name} to {new_commit[:7]}.")
+
+@cli.command()
+@click.argument('ref_name')
+@click.option('--fast', is_flag=True, help='Query the local index for the latest head (fast but requires a trusted indexer).')
+def log(ref_name, fast):
+    """Shows the DeCentGit log for a ref, verifying all signatures."""
+    config = read_config()
+    repo_id = config['repo_id']
+
+    if fast:
+        click.echo(f"Querying index for latest head of '{ref_name}'...")
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT commit_hash FROM refs WHERE repo_id = ? AND ref_name = ?", (repo_id, ref_name))
+            result = c.fetchone()
+            conn.close()
+            if result:
+                commit_hash = result['commit_hash']
+                click.echo(click.style(f"Indexer's authoritative head for '{ref_name}' is {commit_hash[:7]}", fg='green'))
+                click.echo(f"  {commit_hash}")
+            else:
+                click.echo(f"No entry found for '{ref_name}' in the index.")
+            return
+        except sqlite3.OperationalError as e:
+            raise click.ClickException(f"Database error: {e}. Is the indexer running and has it created the database?")
+
+    click.echo(f"Fetching and verifying log for ref '{ref_name}'...")
+    # Use the node URL stored in the repo's config
+    node_url = config['node']
+
+    # 1. Fetch the chain
+    try:
+        response = requests.get(f"{node_url}/chain")
+        response.raise_for_status()
+        chain = response.json()['chain']
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to node at {node_url}.\n{e}")
+
+    # 2. Filter for relevant attestations
+    attestations = []
+    for block in chain:
+        for tx in block['transactions']:
+            if tx.get('repo_id') == repo_id and tx.get('ref') == ref_name:
+                tx['block_index'] = block['index']
+                tx['block_timestamp'] = block['timestamp']
+                attestations.append(tx)
+    
+    if not attestations:
+        click.echo(f"No attestations found for ref '{ref_name}' in this repository.")
+        return
+
+    # 3. Replay and verify the chain (State Reconstruction & Signature Verification)
+    click.echo(click.style(f"Reconstructing history for {ref_name}:", underline=True))
+    
+    current_commit = GENESIS_COMMIT
+    for att in sorted(attestations, key=lambda x: x['block_index']):
+        # a. Verify chain integrity
+        if att['old_commit'] != current_commit:
+            click.echo(click.style(f"Chain inconsistency detected at block {att['block_index']}!", fg='red'))
+            click.echo(f"  Expected old_commit: {current_commit[:7]}")
+            click.echo(f"  Attestation has old_commit: {att['old_commit'][:7]}")
+            raise click.ClickException("Verification failed. The responsibility chain is broken.")
+        
+        # b. Verify signature
+        try:
+            vk = ecdsa.VerifyingKey.from_string(bytes.fromhex(att['signer_identity']), curve=ecdsa.NIST256p)
+            attestation_data = {k: v for k, v in att.items() if k in ['repo_id', 'ref', 'old_commit', 'new_commit']}
+            message = json.dumps(attestation_data, sort_keys=True).encode('utf-8')
+            signature = bytes.fromhex(att['signature'])
+            vk.verify(signature, message)
+            sig_status = click.style("OK", fg='green')
+        except (ecdsa.keys.BadSignatureError, KeyError):
+            sig_status = click.style("FAILED", fg='red')
+            raise click.ClickException(f"Signature verification failed for attestation in block {att['block_index']}.")
+
+        # c. Update state
+        current_commit = att['new_commit']
+        
+        # d. Print log entry
+        ts = datetime.fromtimestamp(att['block_timestamp']).isoformat()
+        click.echo(click.style(f"Attestation in Block {att['block_index']}", fg='yellow'))
+        click.echo(f"  commit:    {att['new_commit']}")
+        click.echo(f"  identity:  {att['signer_identity'][:12]}...")
+        click.echo(f"  timestamp: {ts}")
+        click.echo(f"  signature: {sig_status}")
+    
+    click.echo(click.style("\nVerification successful.", fg='green'))
+    click.echo(f"Current authoritative head for '{ref_name}' is {current_commit[:7]}")
+
+
+@cli.command()
+@click.argument('identity', required=False)
+def reputation(identity):
+    """Calculates the reputation score for an identity."""
+    config = read_config()
+    
+    if identity is None:
+        identity = config.get('signer_identity')
+        if identity is None:
+            raise click.ClickException("No identity specified and no identity found in config. Please run 'decentgit init'.")
+        click.echo(f"Calculating reputation for current user identity: {identity[:12]}...")
+    else:
+        click.echo(f"Calculating reputation for identity: {identity[:12]}...")
+
+    # Use the node URL stored in the repo's config
+    node_url = config['node']
+    
+    # Fetch the chain
+    try:
+        response = requests.get(f"{node_url}/chain")
+        response.raise_for_status()
+        chain = response.json()['chain']
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to node at {node_url}.\n{e}")
+
+    # Filter for all valid attestations from the identity
+    attestations = []
+    for block in chain:
+        for tx in block['transactions']:
+            if tx.get('signer_identity') == identity:
+                # We only count valid attestations for reputation
+                if 'repo_id' in tx and 'ref' in tx:
+                    tx['block_timestamp'] = block['timestamp']
+                    attestations.append(tx)
+
+    if not attestations:
+        click.echo("No attestations found for this identity.")
+        return 0.0
+
+    # Calculate time-decaying reputation
+    # REP(identity, t) := Σ score(Aᵢ) · e^(−λ·(t − time(Aᵢ)))
+    # Half-life H = ln(2)/λ  => λ = ln(2)/H
+    # Let's set a half-life of 180 days.
+    H = 180 * 24 * 60 * 60  # half-life in seconds
+    LAMBDA = math.log(2) / H
+    
+    current_time = time.time()
+    total_rep = 0.0
+    
+    click.echo(f"Found {len(attestations)} attestations...")
+    
+    for att in attestations:
+        score = 1.0  # Each attestation has a base score of 1
+        time_delta = current_time - att['block_timestamp']
+        decay_factor = math.exp(-LAMBDA * time_delta)
+        total_rep += score * decay_factor
+
+    click.echo(click.style(f"\nTotal Reputation Score: {total_rep:.6f}", fg='green', bold=True))
+
+
+if __name__ == '__main__':
+    cli()

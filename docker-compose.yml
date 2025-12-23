@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  blockchain:
+    build:
+      context: .
+      dockerfile: blockchain.Dockerfile
+    ports:
+      - "5001:5000"
+    volumes:
+      # This volume is for the blockchain's internal state.
+      # While the prototype's blockchain doesn't persist across restarts yet,
+      # this is good practice for future persistence.
+      - blockchain_data:/app/blockchain_data 
+    command: python blockchain/app.py
+    
+  indexer:
+    build:
+      context: .
+      dockerfile: indexer.Dockerfile
+    depends_on:
+      - blockchain
+    environment:
+      # Ensure indexer connects to the blockchain service within the Docker network
+      DECENTGIT_NODE_URL: http://blockchain:5000
+    volumes:
+      # Persist the indexer's database
+      - indexer_data:/app/data
+    command: python indexer/indexer.py
+
+  cli:
+    build:
+      context: .
+      dockerfile: cli.Dockerfile
+    depends_on:
+      - blockchain
+    environment:
+      # Ensure CLI connects to the blockchain service within the Docker network
+      DECENTGIT_NODE_URL: http://blockchain:5000
+    volumes:
+      # Mount the current directory (where .decentgit and your git repo live)
+      - .:/app/local_repo
+      # Mount the indexer's data so the --fast flag can work from the CLI container
+      - indexer_data:/app/data
+    # Set the working directory to the mounted local_repo
+    working_dir: /app/local_repo
+    # Override the default ENTRYPOINT to allow running arbitrary commands
+    # The default ENTRYPOINT is "python cli/decentgit", but we want to run bash
+    # entrypoint: ["bash"]
+    # We will let the user run specific commands
+    stdin_open: true # docker run -i
+    tty: true        # docker run -t
+
+volumes:
+  blockchain_data:
+  indexer_data:
